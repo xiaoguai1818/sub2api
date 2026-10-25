@@ -210,6 +210,7 @@ type LiteLLMModelPricing struct {
 	CacheReadInputTokenCost             float64  `json:"cache_read_input_token_cost"`
 	CacheReadInputTokenCostPriority     float64  `json:"cache_read_input_token_cost_priority"`
 	LongContextInputTokenThreshold      int      `json:"long_context_input_token_threshold,omitempty"`
+	LongContextThresholdInclusive       bool     `json:"long_context_threshold_inclusive,omitempty"`
 	LongContextInputCostMultiplier      float64  `json:"long_context_input_cost_multiplier,omitempty"`
 	LongContextOutputCostMultiplier     float64  `json:"long_context_output_cost_multiplier,omitempty"`
 	SupportsServiceTier                 bool     `json:"supports_service_tier"`
@@ -245,6 +246,7 @@ type LiteLLMRawEntry struct {
 	CacheReadInputTokenCost             *float64 `json:"cache_read_input_token_cost"`
 	CacheReadInputTokenCostPriority     *float64 `json:"cache_read_input_token_cost_priority"`
 	LongContextInputTokenThreshold      *int     `json:"long_context_input_token_threshold"`
+	LongContextThresholdInclusive       bool     `json:"long_context_threshold_inclusive"`
 	LongContextInputCostMultiplier      *float64 `json:"long_context_input_cost_multiplier"`
 	LongContextOutputCostMultiplier     *float64 `json:"long_context_output_cost_multiplier"`
 	SupportsServiceTier                 bool     `json:"supports_service_tier"`
@@ -577,6 +579,7 @@ func (s *PricingService) parsePricingData(body []byte) (map[string]*LiteLLMModel
 		if entry.CacheReadInputTokenCostPriority != nil {
 			pricing.CacheReadInputTokenCostPriority = *entry.CacheReadInputTokenCostPriority
 		}
+		pricing.LongContextThresholdInclusive = entry.LongContextThresholdInclusive
 		if entry.LongContextInputTokenThreshold != nil {
 			pricing.LongContextInputTokenThreshold = *entry.LongContextInputTokenThreshold
 		}

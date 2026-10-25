@@ -388,11 +388,30 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 	anthState.Model = originalModel
 	ccState := apicompat.NewResponsesEventToChatState()
 	ccState.Model = originalModel
-	ccState.IncludeUsage = includeUsage
+	// Usage is emitted only if the upstream sends an authoritative usage object.
+	ccState.IncludeUsage = false
 
 	var usage ClaudeUsage
 	var firstTokenMs *int
 	firstChunk := true
+	clientDisconnected := false
+	// Keep the detached upstream stream readable after the client is gone,
+	// but bound draining when the provider stops delivering SSE frames.
+	stopDrainWatch := watchAnthropicCompatDisconnect(c, resp.Body)
+	defer stopDrainWatch()
+	var writeFailureTimer *time.Timer
+	defer func() {
+		if writeFailureTimer != nil {
+			writeFailureTimer.Stop()
+		}
+	}()
+	markClientDisconnected := func() {
+		if clientDisconnected {
+			return
+		}
+		clientDisconnected = true
+		writeFailureTimer = time.AfterFunc(anthropicCompatDisconnectDrainInterval, func() { _ = resp.Body.Close() })
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -403,18 +422,23 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 
 	resultWithUsage := func() *ForwardResult {
 		return &ForwardResult{
-			RequestID:       requestID,
-			Usage:           usage,
-			Model:           originalModel,
-			UpstreamModel:   mappedModel,
-			ReasoningEffort: reasoningEffort,
-			Stream:          true,
-			Duration:        time.Since(startTime),
-			FirstTokenMs:    firstTokenMs,
+			RequestID:        requestID,
+			Usage:            usage,
+			Model:            originalModel,
+			UpstreamModel:    mappedModel,
+			ReasoningEffort:  reasoningEffort,
+			Stream:           true,
+			Duration:         time.Since(startTime),
+			FirstTokenMs:     firstTokenMs,
+			ClientDisconnect: clientDisconnected || (c.Request != nil && c.Request.Context().Err() != nil),
 		}
 	}
 
 	writeChunk := func(chunk apicompat.ChatCompletionsChunk) bool {
+		if clientDisconnected || (c.Request != nil && c.Request.Context().Err() != nil) {
+			markClientDisconnected()
+			return false
+		}
 		sse, err := apicompat.ChatChunkToSSE(chunk)
 		if err != nil {
 			return false
@@ -423,7 +447,8 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 		// c 可能持有请求侧注入的 ToolNameRewrite；无则仅做静态前缀还原。
 		out := string(reverseToolNamesIfPresent(c, []byte(sse)))
 		if _, err := fmt.Fprint(c.Writer, out); err != nil {
-			return true // client disconnected
+			markClientDisconnected()
+			return false
 		}
 		return false
 	}
@@ -452,6 +477,9 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 		if event.Type == "message_start" && event.Message != nil {
 			mergeAnthropicUsage(&usage, event.Message.Usage)
 		}
+
+		syncAnthropicResponsesUsage(anthState, usage)
+		normalizeAnthropicEventUsageForResponses(event, usage)
 
 		// Chain: Anthropic event → Responses events → CC chunks
 		responsesEvents := apicompat.AnthropicEventToResponsesEvents(event, anthState)
@@ -487,9 +515,14 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 			continue
 		}
 
-		if processAnthropicEvent(&event) {
-			return resultWithUsage(), nil
+		// For Anthropic-compatible upstreams, forward authoritative usage
+		// whenever the upstream supplies it, even without include_usage.
+		// A missing/null usage object must not synthesize a billed sample.
+		if (event.Type == "message_start" && gjson.Get(payload, "message.usage").IsObject()) ||
+			(event.Type == "message_delta" && gjson.Get(payload, "usage").IsObject()) {
+			ccState.IncludeUsage = true
 		}
+		processAnthropicEvent(&event)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -501,6 +534,10 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 		}
 	}
 
+	if clientDisconnected || (c.Request != nil && c.Request.Context().Err() != nil) {
+		markClientDisconnected()
+		return resultWithUsage(), nil
+	}
 	// Finalize both state machines
 	finalResEvents := apicompat.FinalizeAnthropicResponsesStream(anthState)
 	for _, resEvt := range finalResEvents {

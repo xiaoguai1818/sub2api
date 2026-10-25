@@ -23,6 +23,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -322,7 +323,8 @@ func (s *OpenAIGatewayService) handleCCStreamingFromNativeAnthropic(
 	anthState.Model = originalModel
 	ccState := apicompat.NewResponsesEventToChatState()
 	ccState.Model = originalModel
-	ccState.IncludeUsage = includeUsage
+	// Usage is emitted only if the upstream sends an authoritative usage object.
+	ccState.IncludeUsage = false
 
 	var usage ClaudeUsage
 	var firstTokenMs *int
@@ -422,6 +424,9 @@ func (s *OpenAIGatewayService) handleCCStreamingFromNativeAnthropic(
 			mergeAnthropicUsage(&usage, event.Message.Usage)
 		}
 
+		syncAnthropicResponsesUsage(anthState, usage)
+		normalizeAnthropicEventUsageForResponses(event, usage)
+
 		// 客户端已断开：跳过转换与写出，继续读上游直到流结束（usage 完整、
 		// 连接及时归还），不再提前 return。
 		if clientDisconnected {
@@ -473,6 +478,10 @@ func (s *OpenAIGatewayService) handleCCStreamingFromNativeAnthropic(
 			continue
 		}
 
+		if (event.Type == "message_start" && gjson.Get(payload, "message.usage").IsObject()) ||
+			(event.Type == "message_delta" && gjson.Get(payload, "usage").IsObject()) {
+			ccState.IncludeUsage = true
+		}
 		if processAnthropicEvent(&event) {
 			return resultWithUsage(), nil
 		}

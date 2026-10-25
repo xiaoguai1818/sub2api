@@ -305,6 +305,8 @@ func mergeAnthropicUsage(dst *ClaudeUsage, src apicompat.AnthropicUsage) {
 		dst.CacheReadInputTokens = cacheReadTokens
 		dst.CacheCreationInputTokens = src.CacheCreationInputTokens
 	} else {
+		// No authoritative prompt total: input_tokens may already be the uncached
+		// bucket, so a later cache event must never subtract it again.
 		if src.InputTokens > 0 {
 			dst.InputTokens = src.InputTokens
 		}
@@ -319,6 +321,31 @@ func mergeAnthropicUsage(dst *ClaudeUsage, src apicompat.AnthropicUsage) {
 	}
 	if src.OutputTokens > 0 {
 		dst.OutputTokens = src.OutputTokens
+	}
+}
+
+// syncAnthropicResponsesUsage ensures the public terminal event uses the
+// normalized usage buckets, not the provider's overlapping raw prompt count.
+func syncAnthropicResponsesUsage(state *apicompat.AnthropicEventToResponsesState, usage ClaudeUsage) {
+	state.InputTokens = usage.InputTokens
+	state.OutputTokens = usage.OutputTokens
+	state.CacheReadInputTokens = usage.CacheReadInputTokens
+	state.CacheCreationInputTokens = usage.CacheCreationInputTokens
+}
+
+func normalizeAnthropicEventUsageForResponses(event *apicompat.AnthropicStreamEvent, usage ClaudeUsage) {
+	normalize := func(dst *apicompat.AnthropicUsage) {
+		if dst == nil {
+			return
+		}
+		dst.InputTokens = usage.InputTokens
+		dst.OutputTokens = usage.OutputTokens
+		dst.CacheReadInputTokens = usage.CacheReadInputTokens
+		dst.CacheCreationInputTokens = usage.CacheCreationInputTokens
+	}
+	normalize(event.Usage)
+	if event.Message != nil {
+		normalize(&event.Message.Usage)
 	}
 }
 
@@ -509,6 +536,22 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 	var usage ClaudeUsage
 	var firstTokenMs *int
 	firstChunk := true
+	clientDisconnected := false
+	stopDrainWatch := watchAnthropicCompatDisconnect(c, resp.Body)
+	defer stopDrainWatch()
+	var writeFailureTimer *time.Timer
+	defer func() {
+		if writeFailureTimer != nil {
+			writeFailureTimer.Stop()
+		}
+	}()
+	markClientDisconnected := func() {
+		if clientDisconnected {
+			return
+		}
+		clientDisconnected = true
+		writeFailureTimer = time.AfterFunc(anthropicCompatDisconnectDrainInterval, func() { _ = resp.Body.Close() })
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -519,14 +562,15 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 
 	resultWithUsage := func() *ForwardResult {
 		return &ForwardResult{
-			RequestID:       requestID,
-			Usage:           usage,
-			Model:           originalModel,
-			UpstreamModel:   mappedModel,
-			ReasoningEffort: reasoningEffort,
-			Stream:          true,
-			Duration:        time.Since(startTime),
-			FirstTokenMs:    firstTokenMs,
+			RequestID:        requestID,
+			Usage:            usage,
+			Model:            originalModel,
+			UpstreamModel:    mappedModel,
+			ReasoningEffort:  reasoningEffort,
+			Stream:           true,
+			Duration:         time.Since(startTime),
+			FirstTokenMs:     firstTokenMs,
+			ClientDisconnect: clientDisconnected || (c.Request != nil && c.Request.Context().Err() != nil),
 		}
 	}
 
@@ -547,6 +591,13 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 			mergeAnthropicUsage(&usage, event.Message.Usage)
 		}
 
+		// Align client usage with the normalized billing buckets.
+		syncAnthropicResponsesUsage(state, usage)
+		normalizeAnthropicEventUsageForResponses(event, usage)
+		if clientDisconnected || (c.Request != nil && c.Request.Context().Err() != nil) {
+			markClientDisconnected()
+			return false
+		}
 		// Convert to Responses events
 		events := apicompat.AnthropicEventToResponsesEvents(event, state)
 		for _, evt := range events {
@@ -573,7 +624,8 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 					logger.L().Info("forward_as_responses stream: client disconnected",
 						zap.String("request_id", requestID),
 					)
-					return true // client disconnected
+					markClientDisconnected()
+					return false
 				}
 			}
 		}
@@ -626,9 +678,7 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 			continue
 		}
 
-		if processEvent(&event) {
-			return resultWithUsage(), nil
-		}
+		processEvent(&event)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -640,6 +690,10 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 		}
 	}
 
+	if clientDisconnected || (c.Request != nil && c.Request.Context().Err() != nil) {
+		markClientDisconnected()
+		return resultWithUsage(), nil
+	}
 	return finalizeStream()
 }
 

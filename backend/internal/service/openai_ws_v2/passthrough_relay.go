@@ -25,6 +25,7 @@ type FrameConn interface {
 
 type Usage struct {
 	InputTokens              int
+	ImageInputTokens         int
 	OutputTokens             int
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
@@ -998,6 +999,21 @@ func parseUsageAndAccumulate(
 	if imageTokens == 0 {
 		imageTokens = usageResult.Get("completion_tokens_details.image_tokens").Int()
 	}
+	imageInputTokens := usageResult.Get("input_tokens_details.image_tokens").Int()
+	if imageInputTokens <= 0 {
+		imageInputTokens = usageResult.Get("prompt_tokens_details.image_tokens").Int()
+	}
+	// 与 HTTP Responses 同口径：usage 缺图片计数时由托管工具 tool_usage.image_gen 回填。
+	imageGen := gjson.GetBytes(message, "response.tool_usage.image_gen")
+	if !imageGen.Exists() {
+		imageGen = gjson.GetBytes(message, "tool_usage.image_gen")
+	}
+	if imageTokens <= 0 {
+		imageTokens = max(imageGen.Get("output_tokens_details.image_tokens").Int(), 0)
+	}
+	if imageInputTokens <= 0 {
+		imageInputTokens = max(imageGen.Get("input_tokens_details.image_tokens").Int(), 0)
+	}
 
 	inputTokens, inputOK := parseUsageIntField(inputResult, true)
 	outputTokens, outputOK := parseUsageIntField(outputResult, true)
@@ -1021,6 +1037,7 @@ func parseUsageAndAccumulate(
 	}
 	parsedUsage := Usage{
 		InputTokens:              inputTokens,
+		ImageInputTokens:         int(imageInputTokens),
 		OutputTokens:             outputTokens,
 		CacheCreationInputTokens: openAICacheCreationTokensFromUsage(usageResult),
 		CacheReadInputTokens:     cachedTokens,
@@ -1028,6 +1045,7 @@ func parseUsageAndAccumulate(
 	}
 
 	state.usage.InputTokens += parsedUsage.InputTokens
+	state.usage.ImageInputTokens += parsedUsage.ImageInputTokens
 	state.usage.OutputTokens += parsedUsage.OutputTokens
 	state.usage.CacheCreationInputTokens += parsedUsage.CacheCreationInputTokens
 	state.usage.CacheReadInputTokens += parsedUsage.CacheReadInputTokens
